@@ -8,6 +8,7 @@ import PyPDF2
 import docx
 import spacy
 from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams # NEW: Required for creating collections
 from fastembed import TextEmbedding
 from dotenv import load_dotenv
 
@@ -21,7 +22,7 @@ app = FastAPI()
 # ==========================================
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "medical_docs")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "medical_docs") 
 
 # Supabase configuration for public bucket
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://xyz.supabase.co")
@@ -29,6 +30,16 @@ SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "public-bucket")
 
 # 1. Initialize Qdrant Client
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+
+# --- NEW: Create the collection if it doesn't exist ---
+if not qdrant.collection_exists(collection_name=QDRANT_COLLECTION):
+    print(f"Collection '{QDRANT_COLLECTION}' not found. Creating it now...")
+    qdrant.create_collection(
+        collection_name=QDRANT_COLLECTION,
+        vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+    )
+    print(f"✅ Collection '{QDRANT_COLLECTION}' created successfully!")
+# --------------------------------------------------------
 
 # 2. Initialize FastEmbed Embedding Model
 embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
@@ -84,7 +95,8 @@ html_content = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Clinical NLP Terminal</title>
     <style>
-        body { background-color: #f4f7f6; font-family: 'Inter', system-ui, -apple-system, sans-serif; margin: 0; padding: 20px; padding-bottom: 280px; color: #2d3748; }
+        /* Increased padding-bottom from 280px to 450px to make room for the larger image */
+        body { background-color: #f4f7f6; font-family: 'Inter', system-ui, -apple-system, sans-serif; margin: 0; padding: 20px; padding-bottom: 450px; color: #2d3748; }
         
         /* Dashboard Header */
         .dashboard-header { border-bottom: 2px solid #e2e8f0; margin-bottom: 20px; padding-bottom: 10px; }
@@ -120,10 +132,21 @@ html_content = """
         button { padding: 12px 24px; cursor: pointer; background: #3182ce; color: white; border: none; border-radius: 6px; font-weight: bold; font-size: 18px; transition: background 0.2s; }
         button:hover { background: #2b6cb0; }
         
-        /* Image Display Layout */
-        #result-container { display: flex; align-items: center; gap: 20px; height: 120px; }
+        /* UPDATED IMAGE DISPLAY LAYOUT */
+        #result-container { display: flex; flex-direction: column; align-items: center; gap: 10px; }
         #result-display { font-weight: bold; font-size: 20px; }
-        #result-image { display: none; max-height: 120px; max-width: 200px; border-radius: 8px; border: 1px solid #cbd5e0; box-shadow: 0 4px 6px rgba(0,0,0,0.1); object-fit: cover; }
+        
+        /* Greatly increased image size. Changed object-fit to 'contain' so nothing gets cut off */
+        #result-image { 
+            display: none; 
+            max-height: 350px; 
+            max-width: 500px; 
+            border-radius: 8px; 
+            border: 1px solid #cbd5e0; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1); 
+            object-fit: contain; 
+            background-color: #f8f9fa;
+        }
         
         .success { color: #38a169; }
         .error { color: #e53e3e; }
@@ -158,7 +181,7 @@ html_content = """
             <button id="search-btn">Search Vector DB</button>
         </div>
         
-        <!-- NEW: Image rendering container -->
+        <!-- Image rendering container -->
         <div id="result-container">
             <div id="result-display"></div>
             <img id="result-image" src="" alt="Matched File" onerror="this.style.display='none'; document.getElementById('result-display').textContent += ' (Image not found in bucket)';" />
@@ -306,7 +329,7 @@ def process_text_nlp(req: ProcessRequest):
 @app.post("/search")
 def search_and_map_image(req: SearchRequest):
     try:
-        # Embed the text
+        # Embed the incoming clicked text
         vectors = list(embedding_model.embed([req.text]))
         query_vector = vectors[0].tolist()
         
@@ -322,14 +345,16 @@ def search_and_map_image(req: SearchRequest):
         if not hits:
             return {"error": "No close vectors found in Qdrant."}
             
-        matched_text = hits[0].payload.get("text", "")
-        if not matched_text:
-            return {"error": "Vector matched, but payload had no 'text' field."}
-            
-        # Extract the first word to match the image name
-        first_word = matched_text.split()[0]
-        image_name = f"{first_word}.png"
+        # Extract the payload directly
+        payload = hits[0].payload
+        matched_text = payload.get("text", "")
         
+        # Grab the exact filename from the metadata uploaded earlier
+        image_name = payload.get("filename", "")
+        
+        if not image_name:
+            return {"error": "Vector matched, but payload had no 'filename' field."}
+            
         # Construct the Supabase Public URL
         # Format: https://[URL]/storage/v1/object/public/[BUCKET]/[FILENAME]
         base_url = SUPABASE_URL.rstrip('/')
