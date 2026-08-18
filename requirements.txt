@@ -5,7 +5,7 @@ pydantic==2.6.4
 PyPDF2==3.0.1
 python-docx==1.1.0
 spacy==3.7.4
-qdrant-client==1.8.0
+qdrant-client==1.11.0
 fastembed==0.2.6
 python-dotenv==1.0.1
 https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_ner_bc5cdr_md-0.5.4.tar.gz
