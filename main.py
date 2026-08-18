@@ -1,4 +1,5 @@
 import os
+import re
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -15,7 +16,7 @@ load_dotenv()
 app = FastAPI()
 
 # ==========================================
-# CONFIGURATION (Loaded from .env)
+# CONFIGURATION
 # ==========================================
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
@@ -29,6 +30,27 @@ class SearchRequest(BaseModel):
     text: str
 
 # ==========================================
+# MEDICAL TERM RECOGNITION (Mock)
+# ==========================================
+SAMPLE_MEDICAL_TERMS = [
+    "hypertension", "diabetes", "tachycardia", "myocardial infarction", 
+    "hypoglycemia", "erythema", "blood pressure", "glucose", "arrhythmia",
+    "leukocyte", "hemoglobin", "carcinoma", "edema", "MRI", "CT scan"
+]
+
+def highlight_medical_terms(text: str) -> str:
+    highlighted_text = text
+    for term in sorted(SAMPLE_MEDICAL_TERMS, key=len, reverse=True):
+        pattern = re.compile(rf'\b({re.escape(term)})\b', re.IGNORECASE)
+        # Wrapping in a styled span that looks like a terminal data node
+        highlighted_text = pattern.sub(
+            r'<span class="medical-term" data-term="\1">\1</span>', 
+            highlighted_text
+        )
+    return highlighted_text
+
+
+# ==========================================
 # FRONTEND (HTML / CSS / JS)
 # ==========================================
 html_content = """
@@ -37,111 +59,301 @@ html_content = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Doc Vector Search</title>
+    <title>MedCore Diagnostic Terminal</title>
     <style>
-        /* Base font size for the whole page */
-        body { font-family: system-ui; margin: 0; padding: 20px; padding-bottom: 220px; background: #f4f4f9; font-size: 18px; }
+        /* Terminal Color Palette */
+        :root {
+            --bg-base: #050914;
+            --bg-panel: #0a1128;
+            --text-main: #94a3b8;
+            --text-header: #e2e8f0;
+            --accent-cyan: #00f0ff;
+            --accent-blue: #3b82f6;
+            --accent-red: #ff3366;
+            --border-color: #1e293b;
+            --font-mono: 'Courier New', Courier, monospace;
+            --font-sans: 'Inter', system-ui, sans-serif;
+        }
+
+        body { 
+            font-family: var(--font-sans); 
+            margin: 0; 
+            padding: 0;
+            background-color: var(--bg-base);
+            color: var(--text-main);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            padding-bottom: 120px;
+        }
+
+        /* Custom Scrollbar for Terminal feel */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: var(--bg-base); }
+        ::-webkit-scrollbar-thumb { background: var(--accent-blue); border-radius: 4px; }
+
+        header {
+            width: 100%;
+            max-width: 1200px;
+            padding: 30px 20px;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 20px;
+        }
+
+        h1 { 
+            font-family: var(--font-mono);
+            color: var(--accent-cyan);
+            font-size: 24px;
+            margin: 0;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            text-shadow: 0 0 10px rgba(0, 240, 255, 0.3);
+        }
         
-        h2 { font-size: 28px; margin-bottom: 10px; }
-        .upload-section { margin-bottom: 20px; }
+        .blink { animation: blinker 1s linear infinite; }
+        @keyframes blinker { 50% { opacity: 0; } }
+
+        .container {
+            width: 100%;
+            max-width: 1200px;
+            padding: 0 20px;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        /* Upload Panel Styling */
+        .upload-panel { 
+            background: var(--bg-panel);
+            border: 1px dashed var(--accent-blue);
+            border-radius: 8px;
+            padding: 30px;
+            text-align: center;
+            transition: all 0.3s ease;
+        }
         
-        input[type="file"] { font-size: 18px; padding: 5px; cursor: pointer; }
+        .upload-panel:hover {
+            border-color: var(--accent-cyan);
+            box-shadow: 0 0 15px rgba(0, 240, 255, 0.1);
+        }
+
+        .upload-label {
+            font-family: var(--font-mono);
+            color: var(--accent-cyan);
+            font-size: 16px;
+            cursor: pointer;
+            display: inline-block;
+            padding: 10px 20px;
+            background: rgba(0, 240, 255, 0.1);
+            border: 1px solid var(--accent-cyan);
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
         
-        /* Document display box */
-        #content-display { white-space: pre-wrap; line-height: 1.8; border: 1px solid #ddd; padding: 25px; background: white; height: 50vh; overflow-y: auto; border-radius: 8px; font-size: 20px; }
+        .upload-label:hover {
+            background: var(--accent-cyan);
+            color: var(--bg-base);
+        }
         
-        /* Scaled up the selection bar layout */
-        .selection-bar { position: fixed; bottom: 0; left: 0; width: 100%; background: white; border-top: 2px solid #007bff; padding: 20px; box-shadow: 0 -4px 12px rgba(0,0,0,0.1); display: flex; flex-direction: column; align-items: center; gap: 15px; z-index: 1000; box-sizing: border-box; }
+        input[type="file"] { display: none; }
+
+        /* Terminal Screen (Document Display) */
+        .terminal-window {
+            background: #020617;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+
+        .terminal-header {
+            background: var(--bg-panel);
+            padding: 10px 20px;
+            font-family: var(--font-mono);
+            font-size: 14px;
+            color: var(--accent-blue);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+        }
+
+        #content-display { 
+            white-space: pre-wrap; 
+            line-height: 1.8; 
+            padding: 30px; 
+            height: 50vh; 
+            overflow-y: auto; 
+            font-size: 16px; 
+            font-family: var(--font-mono);
+        }
+
+        /* High-Tech Medical Terms */
+        .medical-term {
+            color: var(--accent-cyan);
+            background: rgba(0, 240, 255, 0.05);
+            border: 1px solid rgba(0, 240, 255, 0.3);
+            border-radius: 3px;
+            padding: 2px 6px;
+            cursor: crosshair;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
         
-        #selected-text { width: 90%; padding: 15px; border: 1px dashed #aaa; background: #fafafa; min-height: 30px; text-align: center; border-radius: 4px; color: #555; font-size: 22px; }
-        
-        /* New Manual Input Field */
-        #manual-input { width: 90%; padding: 15px; border: 1px solid #ccc; border-radius: 6px; font-size: 20px; box-sizing: border-box; transition: border-color 0.2s; }
-        #manual-input:focus { outline: none; border-color: #007bff; box-shadow: 0 0 5px rgba(0,123,255,0.3); }
-        
-        button { padding: 15px 32px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 6px; font-weight: bold; font-size: 20px; transition: background 0.2s; }
-        button:hover { background: #0056b3; }
-        #result-filename { font-weight: bold; color: #28a745; min-height: 24px; font-size: 24px; margin-top: 5px; }
+        .medical-term:hover {
+            background: var(--accent-cyan);
+            color: var(--bg-base);
+            box-shadow: 0 0 10px var(--accent-cyan);
+        }
+
+        /* Telemetry Panel (Bottom Bar) */
+        .telemetry-panel { 
+            position: fixed; 
+            bottom: 0; 
+            left: 0; 
+            width: 100%; 
+            background: rgba(10, 17, 40, 0.95); 
+            backdrop-filter: blur(10px);
+            border-top: 1px solid var(--accent-blue); 
+            padding: 20px; 
+            display: flex; 
+            justify-content: space-around;
+            align-items: center; 
+            z-index: 1000; 
+            box-sizing: border-box; 
+            font-family: var(--font-mono);
+        }
+
+        .panel-section {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 45%;
+        }
+
+        .label {
+            font-size: 12px;
+            color: var(--text-main);
+            letter-spacing: 1px;
+            margin-bottom: 5px;
+        }
+
+        .value {
+            font-size: 20px;
+            color: var(--text-header);
+            background: #020617;
+            padding: 10px 20px;
+            border-radius: 4px;
+            border: 1px solid var(--border-color);
+            width: 100%;
+            text-align: center;
+            box-sizing: border-box;
+            min-height: 48px;
+        }
+
+        .value.highlight-cyan { color: var(--accent-cyan); border-color: var(--accent-cyan); box-shadow: 0 0 10px rgba(0, 240, 255, 0.2); }
+        .value.highlight-red { color: var(--accent-red); border-color: var(--accent-red); box-shadow: 0 0 10px rgba(255, 51, 102, 0.2); }
     </style>
 </head>
 <body>
-    <div class="upload-section">
-        <h2>Upload Document</h2>
-        <input type="file" id="file-upload" accept=".txt,.pdf,.doc,.docx" />
-    </div>
-    
-    <div id="content-display">Your document text will appear here. Highlight any text to search.</div>
 
-    <div class="selection-bar">
-        <div id="selected-text">No text selected yet...</div>
-        <input type="text" id="manual-input" placeholder="Or type your search query here and press Enter..." />
-        <button id="search-btn">Search Vector</button>
-        <div id="result-filename"></div>
+    <header>
+        <h1><span class="blink">_</span> SYS.MED_CORE // DIAGNOSTIC TERMINAL</h1>
+    </header>
+
+    <div class="container">
+        <div class="upload-panel">
+            <label class="upload-label" for="file-upload">
+                [+] INITIALIZE DOCUMENT SCAN
+            </label>
+            <input type="file" id="file-upload" accept=".txt,.pdf,.docx" />
+            <div id="file-name-display" style="margin-top: 15px; font-family: var(--font-mono); font-size: 14px; color: var(--text-main);">NO FILE SELECTED</div>
+        </div>
+        
+        <div class="terminal-window">
+            <div class="terminal-header">
+                <span>VIEWER_MODULE</span>
+                <span>STATUS: <span id="doc-status" style="color: var(--accent-cyan);">AWAITING_INPUT</span></span>
+            </div>
+            <div id="content-display">SYSTEM READY. PLEASE UPLOAD PATIENT REPORT TO BEGIN.</div>
+        </div>
+    </div>
+
+    <div class="telemetry-panel">
+        <div class="panel-section">
+            <span class="label">TARGET ENTITY</span>
+            <span id="selected-text" class="value">--</span>
+        </div>
+        <div class="panel-section">
+            <span class="label">DATABASE MAPPING</span>
+            <span id="result-filename" class="value">STANDBY</span>
+        </div>
     </div>
 
     <script>
+        // 1. Upload & Parse Document
         document.getElementById('file-upload').addEventListener('change', async (e) => {
             const file = e.target.files[0];
             if (!file) return;
             
-            document.getElementById('content-display').textContent = "Extracting text...";
+            // Update UI for loading state
+            document.getElementById('file-name-display').textContent = `FILE: ${file.name}`;
+            document.getElementById('doc-status').textContent = 'PROCESSING...';
+            document.getElementById('doc-status').style.color = '#ff9900';
+            document.getElementById('content-display').textContent = ">> EXTRACTING TEXT & SCANNING FOR MEDICAL ENTITIES...";
+            
             const formData = new FormData();
             formData.append('file', file);
             
-            const res = await fetch('/upload', { method: 'POST', body: formData });
-            const data = await res.json();
-            document.getElementById('content-display').textContent = data.text;
-        });
-
-        // Handle highlighting text from the document
-        document.getElementById('content-display').addEventListener('mouseup', () => {
-            const selection = window.getSelection().toString().trim();
-            if (selection) {
-                document.getElementById('selected-text').textContent = selection;
-                document.getElementById('manual-input').value = ""; // Clear manual input to avoid confusion
-                document.getElementById('result-filename').textContent = "";
-            }
-        });
-
-        // Handle manual text entry and "Enter" key press
-        document.getElementById('manual-input').addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault(); // Prevent default form submission behavior
-                const manualText = e.target.value.trim();
+            try {
+                const res = await fetch('/upload', { method: 'POST', body: formData });
+                const data = await res.json();
                 
-                if (manualText) {
-                    // Override the selected text display
-                    document.getElementById('selected-text').textContent = manualText;
-                    document.getElementById('result-filename').textContent = "";
-                    
-                    // Automatically trigger the search button
-                    document.getElementById('search-btn').click();
-                }
+                document.getElementById('content-display').innerHTML = data.html_text;
+                document.getElementById('doc-status').textContent = 'SCAN_COMPLETE';
+                document.getElementById('doc-status').style.color = 'var(--accent-cyan)';
+            } catch (err) {
+                document.getElementById('content-display').textContent = ">> ERROR: FAILED TO PROCESS DOCUMENT.";
+                document.getElementById('doc-status').textContent = 'SYS_ERROR';
+                document.getElementById('doc-status').style.color = 'var(--accent-red)';
             }
         });
 
-        // The main search execution logic
-        document.getElementById('search-btn').addEventListener('click', async () => {
-            const text = document.getElementById('selected-text').textContent;
-            if (!text || text === 'No text selected yet...') return alert('Please highlight or type text first.');
+        // 2. Handle Clicks on Medical Terms
+        document.getElementById('content-display').addEventListener('click', async (e) => {
+            if (e.target.classList.contains('medical-term')) {
+                const term = e.target.getAttribute('data-term');
+                
+                // Update UI: Target locked
+                const targetBox = document.getElementById('selected-text');
+                targetBox.textContent = `> ${term.toUpperCase()}`;
+                targetBox.className = 'value highlight-cyan';
 
-            const btn = document.getElementById('search-btn');
-            btn.textContent = "Searching...";
-            document.getElementById('result-filename').textContent = "";
-            
-            const res = await fetch('/search', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text })
-            });
-            const data = await res.json();
-            
-            btn.textContent = "Search Vector";
-
-            if (data.image_name) {
-                document.getElementById('result-filename').textContent = "Matched Target File: " + data.image_name;
-            } else {
-                alert(data.error || 'No match found.');
+                // Update UI: Mapping status
+                const matchBox = document.getElementById('result-filename');
+                matchBox.textContent = "QUERYING VECTOR DB...";
+                matchBox.className = 'value';
+                
+                try {
+                    const res = await fetch('/search', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text: term })
+                    });
+                    const data = await res.json();
+                    
+                    if (data.image_name) {
+                        matchBox.textContent = `[ MATCH: ${data.image_name} ]`;
+                        matchBox.className = 'value highlight-cyan';
+                    } else {
+                        matchBox.textContent = `[ ERROR: ${data.error || 'NO MATCH'} ]`;
+                        matchBox.className = 'value highlight-red';
+                    }
+                } catch (err) {
+                    matchBox.textContent = "[ FATAL: NETWORK ERROR ]";
+                    matchBox.className = 'value highlight-red';
+                }
             }
         });
     </script>
@@ -168,42 +380,41 @@ async def parse_document(file: UploadFile = File(...)):
         elif filename.endswith('.pdf'):
             reader = PyPDF2.PdfReader(io.BytesIO(content))
             text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
-        elif filename.endswith('.docx') or filename.endswith('.doc'):
+        elif filename.endswith('.docx'):
             doc = docx.Document(io.BytesIO(content))
             text = "\n".join([p.text for p in doc.paragraphs])
         else:
-            text = "Unsupported file format."
-    except Exception as e:
-        text = f"Error extracting text: {str(e)}"
+            text = ">> ERROR: UNSUPPORTED FILE FORMAT."
+            
+        html_text = highlight_medical_terms(text)
         
-    return {"text": text}
+    except Exception as e:
+        html_text = f">> SYSTEM EXCEPTION: {str(e)}"
+        
+    return {"html_text": html_text}
 
 @app.post("/search")
 def search_and_map_image(req: SearchRequest):
-    # 1. Embed the highlighted/typed text
     vectors = list(embedding_model.embed([req.text]))
     query_vector = vectors[0].tolist()
     
-    # 2. Search Qdrant using the new query_points API
     response = qdrant.query_points(
         collection_name=QDRANT_COLLECTION,
         query=query_vector,
         limit=1
     )
     
-    # query_points returns a Response object containing a list of 'points'
     hits = response.points
     
     if not hits:
-        return {"error": "No close vectors found in Qdrant."}
+        return {"error": "NO VECTOR PROXIMITY"}
         
     matched_text = hits[0].payload.get("text", "")
     if not matched_text:
-        return {"error": "Vector matched, but payload had no 'text' field."}
+        return {"error": "NULL PAYLOAD TEXT"}
         
-    # 3. Extract the first word
-    first_word = matched_text.split()[0]
-    image_name = f"{first_word}.png"
+    first_word = re.sub(r'[^a-zA-Z0-9]', '', matched_text.split()[0])
+    image_name = f"{first_word.lower()}.png"
     
     return {
         "matched_text": matched_text,
