@@ -1,371 +1,268 @@
 import os
-import re
+import io
+import warnings
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import io
 import PyPDF2
 import docx
+import spacy
 from qdrant_client import QdrantClient
 from fastembed import TextEmbedding
 from dotenv import load_dotenv
 
-# Import our new Medical NLP library
-import spacy
-
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 app = FastAPI()
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION & INITIALIZATION
 # ==========================================
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "medical_docs")
 
-# Initialize Qdrant & Embedding Model 
+# Supabase configuration for public bucket
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://xyz.supabase.co")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "public-bucket")
+
+# 1. Initialize Qdrant Client
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+
+# 2. Initialize FastEmbed Embedding Model
 embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
-# ==========================================
-# MEDICAL NLP ENGINE (SciSpaCy)
-# ==========================================
-# Load the pre-trained biomedical model (Detects Diseases and Drugs/Chemicals)
-try:
-    med_nlp = spacy.load("en_ner_bc5cdr_md")
-except OSError:
-    raise RuntimeError(
-        "Medical NLP model not found. Please install it using:\n"
-        "pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_ner_bc5cdr_md-0.5.4.tar.gz"
-    )
+# 3. Initialize Clinical NLP Model
+warnings.filterwarnings("ignore", category=FutureWarning)
+nlp = spacy.load("en_ner_bc5cdr_md")
 
+# ==========================================
+# SCHEMAS
+# ==========================================
 class SearchRequest(BaseModel):
     text: str
 
-def highlight_medical_terms(text: str) -> str:
-    """
-    Uses AI to dynamically find medical entities and wrap them in HTML tags.
-    """
-    doc = med_nlp(text)
-    
-    # We must replace text from the end to the beginning so that changing string 
-    # lengths doesn't mess up the character indices of earlier entities.
-    entities = sorted(doc.ents, key=lambda e: e.start_char, reverse=True)
-    
-    highlighted_text = text
-    
-    for ent in entities:
-        # ent.label_ will be "DISEASE" or "CHEMICAL"
-        term = ent.text
-        start = ent.start_char
-        end = ent.end_char
+class ProcessRequest(BaseModel):
+    text: str
+
+# ==========================================
+# NLP PROCESSING LOGIC
+# ==========================================
+def hyperlink_medical_terms(text: str) -> dict:
+    if not text:
+        return {"html": "", "count": 0}
         
-        # Wrap the exact detected entity in our terminal node HTML
-        replacement = f'<span class="medical-term" data-term="{term}">{term}</span>'
-        highlighted_text = highlighted_text[:start] + replacement + highlighted_text[end:]
-        
-    return highlighted_text
+    doc = nlp(text)
+    entity_count = len(doc.ents)
+    
+    if not doc.ents:
+        return {"html": text.replace("\n", "<br>"), "count": 0}
+
+    output_parts = []
+    last_idx = 0
+
+    for ent in doc.ents:
+        output_parts.append(text[last_idx:ent.start_char])
+        hyperlink = f'<span class="med-entity" onclick="triggerEntitySearch(this.innerText)" title="Run Vector Search for {ent.text}">{ent.text}</span>'
+        output_parts.append(hyperlink)
+        last_idx = ent.end_char
+
+    output_parts.append(text[last_idx:])
+    final_html = "".join(output_parts).replace("\n", "<br>")
+    
+    return {"html": final_html, "count": entity_count}
 
 # ==========================================
 # FRONTEND (HTML / CSS / JS)
 # ==========================================
-# (The frontend remains the exact same dark-mode terminal layout)
 html_content = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MedCore Diagnostic Terminal</title>
+    <title>Clinical NLP Terminal</title>
     <style>
-        /* Terminal Color Palette */
-        :root {
-            --bg-base: #050914;
-            --bg-panel: #0a1128;
-            --text-main: #94a3b8;
-            --text-header: #e2e8f0;
-            --accent-cyan: #00f0ff;
-            --accent-blue: #3b82f6;
-            --accent-red: #ff3366;
-            --border-color: #1e293b;
-            --font-mono: 'Courier New', Courier, monospace;
-            --font-sans: 'Inter', system-ui, sans-serif;
-        }
-
-        body { 
-            font-family: var(--font-sans); 
-            margin: 0; 
-            padding: 0;
-            background-color: var(--bg-base);
-            color: var(--text-main);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            min-height: 100vh;
-            padding-bottom: 120px;
-        }
-
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: var(--bg-base); }
-        ::-webkit-scrollbar-thumb { background: var(--accent-blue); border-radius: 4px; }
-
-        header {
-            width: 100%;
-            max-width: 1200px;
-            padding: 30px 20px;
-            border-bottom: 1px solid var(--border-color);
-            margin-bottom: 20px;
-        }
-
-        h1 { 
-            font-family: var(--font-mono);
-            color: var(--accent-cyan);
-            font-size: 24px;
-            margin: 0;
-            text-transform: uppercase;
-            letter-spacing: 2px;
-            text-shadow: 0 0 10px rgba(0, 240, 255, 0.3);
-        }
+        body { background-color: #f4f7f6; font-family: 'Inter', system-ui, -apple-system, sans-serif; margin: 0; padding: 20px; padding-bottom: 280px; color: #2d3748; }
         
-        .blink { animation: blinker 1s linear infinite; }
-        @keyframes blinker { 50% { opacity: 0; } }
+        /* Dashboard Header */
+        .dashboard-header { border-bottom: 2px solid #e2e8f0; margin-bottom: 20px; padding-bottom: 10px; }
+        .dashboard-header h1 { margin: 0; font-size: 28px; color: #1a202c; }
+        .dashboard-header p { margin: 5px 0 0 0; color: #718096; font-size: 16px; }
 
-        .container {
-            width: 100%;
-            max-width: 1200px;
-            padding: 0 20px;
-            box-sizing: border-box;
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
+        /* Main Layout */
+        .container { display: flex; gap: 20px; height: 50vh; }
+        .col { flex: 1; display: flex; flex-direction: column; }
+        .col h3 { margin-top: 0; margin-bottom: 10px; font-size: 18px; color: #4a5568; }
 
-        .upload-panel { 
-            background: var(--bg-panel);
-            border: 1px dashed var(--accent-blue);
-            border-radius: 8px;
-            padding: 30px;
-            text-align: center;
-            transition: all 0.3s ease;
-        }
+        /* Controls */
+        input[type="file"] { margin-bottom: 15px; font-size: 16px; padding: 8px; cursor: pointer; border: 1px solid #cbd5e0; border-radius: 6px; background: white;}
+        textarea { flex: 1; padding: 15px; font-size: 16px; border: 1px solid #cbd5e0; border-radius: 8px; resize: none; font-family: inherit; line-height: 1.6; }
+        textarea:focus { outline: none; border-color: #3182ce; box-shadow: 0 0 0 1px #3182ce; }
+
+        /* Analyzed Output Box */
+        #content-display { flex: 1; background-color: #ffffff; border: 1px solid #e0e6ed; border-radius: 8px; padding: 24px; overflow-y: auto; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); font-size: 16px; line-height: 1.8; }
         
-        .upload-panel:hover {
-            border-color: var(--accent-cyan);
-            box-shadow: 0 0 15px rgba(0, 240, 255, 0.1);
-        }
+        /* Medical Entity Chips */
+        .med-entity { background-color: #e6f2ff; color: #0056b3; border: 1px solid #b3d7ff; padding: 2px 8px; border-radius: 12px; cursor: pointer; font-weight: 600; font-size: 0.95em; transition: all 0.2s ease-in-out; display: inline-block; }
+        .med-entity:hover { background-color: #0056b3; color: #ffffff; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .status-text { font-size: 14px; color: #4a5568; margin-bottom: 10px; font-weight: bold; }
 
-        .upload-label {
-            font-family: var(--font-mono);
-            color: var(--accent-cyan);
-            font-size: 16px;
-            cursor: pointer;
-            display: inline-block;
-            padding: 10px 20px;
-            background: rgba(0, 240, 255, 0.1);
-            border: 1px solid var(--accent-cyan);
-            border-radius: 4px;
-            transition: all 0.2s;
-        }
+        /* Bottom Search Pipeline Panel */
+        .selection-bar { position: fixed; bottom: 0; left: 0; width: 100%; background: white; border-top: 3px solid #3182ce; padding: 20px; box-shadow: 0 -4px 12px rgba(0,0,0,0.05); display: flex; flex-direction: column; align-items: center; gap: 15px; box-sizing: border-box; z-index: 1000; }
+        .selection-bar h4 { margin: 0; color: #4a5568; font-size: 16px; text-transform: uppercase; letter-spacing: 1px; }
         
-        .upload-label:hover {
-            background: var(--accent-cyan);
-            color: var(--bg-base);
-        }
+        .search-controls { display: flex; gap: 10px; width: 80%; max-width: 800px; }
+        #manual-input { flex: 1; padding: 12px 15px; border: 1px solid #cbd5e0; border-radius: 6px; font-size: 18px; transition: border-color 0.2s; }
+        #manual-input:focus { outline: none; border-color: #3182ce; }
         
-        input[type="file"] { display: none; }
-
-        .terminal-window {
-            background: #020617;
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            overflow: hidden;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-        }
-
-        .terminal-header {
-            background: var(--bg-panel);
-            padding: 10px 20px;
-            font-family: var(--font-mono);
-            font-size: 14px;
-            color: var(--accent-blue);
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            justify-content: space-between;
-        }
-
-        #content-display { 
-            white-space: pre-wrap; 
-            line-height: 1.8; 
-            padding: 30px; 
-            height: 50vh; 
-            overflow-y: auto; 
-            font-size: 16px; 
-            font-family: var(--font-mono);
-        }
-
-        /* High-Tech Medical Terms */
-        .medical-term {
-            color: var(--accent-cyan);
-            background: rgba(0, 240, 255, 0.05);
-            border: 1px solid rgba(0, 240, 255, 0.3);
-            border-radius: 3px;
-            padding: 2px 6px;
-            cursor: crosshair;
-            font-weight: 600;
-            transition: all 0.2s;
-        }
+        button { padding: 12px 24px; cursor: pointer; background: #3182ce; color: white; border: none; border-radius: 6px; font-weight: bold; font-size: 18px; transition: background 0.2s; }
+        button:hover { background: #2b6cb0; }
         
-        .medical-term:hover {
-            background: var(--accent-cyan);
-            color: var(--bg-base);
-            box-shadow: 0 0 10px var(--accent-cyan);
-        }
-
-        .telemetry-panel { 
-            position: fixed; 
-            bottom: 0; 
-            left: 0; 
-            width: 100%; 
-            background: rgba(10, 17, 40, 0.95); 
-            backdrop-filter: blur(10px);
-            border-top: 1px solid var(--accent-blue); 
-            padding: 20px; 
-            display: flex; 
-            justify-content: space-around;
-            align-items: center; 
-            z-index: 1000; 
-            box-sizing: border-box; 
-            font-family: var(--font-mono);
-        }
-
-        .panel-section {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            width: 45%;
-        }
-
-        .label {
-            font-size: 12px;
-            color: var(--text-main);
-            letter-spacing: 1px;
-            margin-bottom: 5px;
-        }
-
-        .value {
-            font-size: 20px;
-            color: var(--text-header);
-            background: #020617;
-            padding: 10px 20px;
-            border-radius: 4px;
-            border: 1px solid var(--border-color);
-            width: 100%;
-            text-align: center;
-            box-sizing: border-box;
-            min-height: 48px;
-        }
-
-        .value.highlight-cyan { color: var(--accent-cyan); border-color: var(--accent-cyan); box-shadow: 0 0 10px rgba(0, 240, 255, 0.2); }
-        .value.highlight-red { color: var(--accent-red); border-color: var(--accent-red); box-shadow: 0 0 10px rgba(255, 51, 102, 0.2); }
+        /* Image Display Layout */
+        #result-container { display: flex; align-items: center; gap: 20px; height: 120px; }
+        #result-display { font-weight: bold; font-size: 20px; }
+        #result-image { display: none; max-height: 120px; max-width: 200px; border-radius: 8px; border: 1px solid #cbd5e0; box-shadow: 0 4px 6px rgba(0,0,0,0.1); object-fit: cover; }
+        
+        .success { color: #38a169; }
+        .error { color: #e53e3e; }
     </style>
 </head>
 <body>
+    <div class="dashboard-header">
+        <h1>⚕️ Clinical NLP Terminal</h1>
+        <p>Automated Entity Recognition & Supabase Visual Mapping</p>
+    </div>
 
-    <header>
-        <h1><span class="blink">_</span> SYS.MED_CORE // DIAGNOSTIC TERMINAL</h1>
-    </header>
+    <input type="file" id="file-upload" accept=".txt,.pdf,.doc,.docx" />
 
     <div class="container">
-        <div class="upload-panel">
-            <label class="upload-label" for="file-upload">
-                [+] INITIALIZE DOCUMENT SCAN
-            </label>
-            <input type="file" id="file-upload" accept=".txt,.pdf,.docx" />
-            <div id="file-name-display" style="margin-top: 15px; font-family: var(--font-mono); font-size: 14px; color: var(--text-main);">NO FILE SELECTED</div>
+        <div class="col">
+            <h3>📝 Source Editor</h3>
+            <textarea id="source-editor" placeholder="Type or upload clinical text here..."></textarea>
         </div>
         
-        <div class="terminal-window">
-            <div class="terminal-header">
-                <span>VIEWER_MODULE</span>
-                <span>STATUS: <span id="doc-status" style="color: var(--accent-cyan);">AWAITING_INPUT</span></span>
-            </div>
-            <div id="content-display">SYSTEM READY. PLEASE UPLOAD PATIENT REPORT TO BEGIN.</div>
+        <div class="col">
+            <h3>🔍 Entity Extraction</h3>
+            <div class="status-text" id="status-counter">Status: Waiting for text...</div>
+            <div id="content-display">Your analyzed text will appear here.</div>
         </div>
     </div>
 
-    <div class="telemetry-panel">
-        <div class="panel-section">
-            <span class="label">TARGET ENTITY</span>
-            <span id="selected-text" class="value">--</span>
+    <!-- BOTTOM: Vector Search Pipeline -->
+    <div class="selection-bar">
+        <h4>Vector Search Pipeline</h4>
+        <div class="search-controls">
+            <input type="text" id="manual-input" placeholder="Click a highlighted medical term, or type here..." />
+            <button id="search-btn">Search Vector DB</button>
         </div>
-        <div class="panel-section">
-            <span class="label">DATABASE MAPPING</span>
-            <span id="result-filename" class="value">STANDBY</span>
+        
+        <!-- NEW: Image rendering container -->
+        <div id="result-container">
+            <div id="result-display"></div>
+            <img id="result-image" src="" alt="Matched File" onerror="this.style.display='none'; document.getElementById('result-display').textContent += ' (Image not found in bucket)';" />
         </div>
     </div>
 
     <script>
-        // 1. Upload & Parse Document
+        const editor = document.getElementById('source-editor');
+        const display = document.getElementById('content-display');
+        const counter = document.getElementById('status-counter');
+        const manualInput = document.getElementById('manual-input');
+        const searchBtn = document.getElementById('search-btn');
+        const resultDisplay = document.getElementById('result-display');
+        const resultImage = document.getElementById('result-image');
+        
+        let typingTimer;
+
+        async function processText() {
+            const text = editor.value;
+            if (!text.trim()) {
+                display.innerHTML = "";
+                counter.innerText = "Status: Waiting for text...";
+                return;
+            }
+            
+            counter.innerText = "Status: Analyzing medical entities...";
+            const res = await fetch('/process', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text })
+            });
+            const data = await res.json();
+            
+            display.innerHTML = data.html;
+            counter.innerText = `Status: Analysis complete. ${data.count} medical entities detected.`;
+        }
+
+        editor.addEventListener('keyup', () => {
+            clearTimeout(typingTimer);
+            typingTimer = setTimeout(processText, 500);
+        });
+
         document.getElementById('file-upload').addEventListener('change', async (e) => {
             const file = e.target.files[0];
             if (!file) return;
             
-            document.getElementById('file-name-display').textContent = `FILE: ${file.name}`;
-            document.getElementById('doc-status').textContent = 'NLP_ENGINE_SCANNING...';
-            document.getElementById('doc-status').style.color = '#ff9900';
-            document.getElementById('content-display').textContent = ">> EXTRACTING TEXT & RUNNING ENTITY RECOGNITION (NER)...\\n>> THIS MAY TAKE A MOMENT DEPENDING ON DOC SIZE...";
-            
+            counter.innerText = "Status: Extracting text from document...";
             const formData = new FormData();
             formData.append('file', file);
             
+            const res = await fetch('/upload', { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            editor.value = data.text;
+            processText();
+        });
+
+        function triggerEntitySearch(term) {
+            manualInput.value = term;
+            searchBtn.click();
+        }
+
+        searchBtn.addEventListener('click', async () => {
+            const text = manualInput.value.trim();
+            if (!text) return alert('Please enter or click a term to search.');
+
+            // Reset state
+            searchBtn.textContent = "Searching...";
+            resultDisplay.textContent = "";
+            resultDisplay.className = "";
+            resultImage.style.display = "none";
+            resultImage.src = "";
+            
             try {
-                const res = await fetch('/upload', { method: 'POST', body: formData });
+                const res = await fetch('/search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text })
+                });
                 const data = await res.json();
                 
-                document.getElementById('content-display').innerHTML = data.html_text;
-                document.getElementById('doc-status').textContent = 'SCAN_COMPLETE';
-                document.getElementById('doc-status').style.color = 'var(--accent-cyan)';
+                if (data.image_name) {
+                    resultDisplay.textContent = "🎯 Matched Target File: " + data.image_name;
+                    resultDisplay.className = "success";
+                    
+                    // Show the image pulled directly from Supabase
+                    resultImage.src = data.image_url;
+                    resultImage.style.display = "block";
+                } else {
+                    resultDisplay.textContent = "❌ " + (data.error || 'No match found.');
+                    resultDisplay.className = "error";
+                }
             } catch (err) {
-                document.getElementById('content-display').textContent = ">> ERROR: FAILED TO PROCESS DOCUMENT.";
-                document.getElementById('doc-status').textContent = 'SYS_ERROR';
-                document.getElementById('doc-status').style.color = 'var(--accent-red)';
+                resultDisplay.textContent = "❌ Server error connecting to Qdrant.";
+                resultDisplay.className = "error";
+            } finally {
+                searchBtn.textContent = "Search Vector DB";
             }
         });
 
-        // 2. Handle Clicks on Medical Terms
-        document.getElementById('content-display').addEventListener('click', async (e) => {
-            if (e.target.classList.contains('medical-term')) {
-                const term = e.target.getAttribute('data-term');
-                
-                const targetBox = document.getElementById('selected-text');
-                targetBox.textContent = `> ${term.toUpperCase()}`;
-                targetBox.className = 'value highlight-cyan';
-
-                const matchBox = document.getElementById('result-filename');
-                matchBox.textContent = "QUERYING VECTOR DB...";
-                matchBox.className = 'value';
-                
-                try {
-                    const res = await fetch('/search', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ text: term })
-                    });
-                    const data = await res.json();
-                    
-                    if (data.image_name) {
-                        matchBox.textContent = `[ MATCH: ${data.image_name} ]`;
-                        matchBox.className = 'value highlight-cyan';
-                    } else {
-                        matchBox.textContent = `[ ERROR: ${data.error || 'NO MATCH'} ]`;
-                        matchBox.className = 'value highlight-red';
-                    }
-                } catch (err) {
-                    matchBox.textContent = "[ FATAL: NETWORK ERROR ]";
-                    matchBox.className = 'value highlight-red';
-                }
+        manualInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                searchBtn.click();
             }
         });
     </script>
@@ -392,44 +289,56 @@ async def parse_document(file: UploadFile = File(...)):
         elif filename.endswith('.pdf'):
             reader = PyPDF2.PdfReader(io.BytesIO(content))
             text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
-        elif filename.endswith('.docx'):
+        elif filename.endswith('.docx') or filename.endswith('.doc'):
             doc = docx.Document(io.BytesIO(content))
             text = "\n".join([p.text for p in doc.paragraphs])
         else:
-            text = ">> ERROR: UNSUPPORTED FILE FORMAT."
-            
-        # Run text through SciSpaCy NLP Engine
-        html_text = highlight_medical_terms(text)
-        
+            text = "Unsupported file format."
     except Exception as e:
-        html_text = f">> SYSTEM EXCEPTION: {str(e)}"
+        text = f"Error extracting text: {str(e)}"
         
-    return {"html_text": html_text}
+    return {"text": text}
+
+@app.post("/process")
+def process_text_nlp(req: ProcessRequest):
+    return hyperlink_medical_terms(req.text)
 
 @app.post("/search")
 def search_and_map_image(req: SearchRequest):
-    vectors = list(embedding_model.embed([req.text]))
-    query_vector = vectors[0].tolist()
-    
-    response = qdrant.query_points(
-        collection_name=QDRANT_COLLECTION,
-        query=query_vector,
-        limit=1
-    )
-    
-    hits = response.points
-    
-    if not hits:
-        return {"error": "NO VECTOR PROXIMITY"}
+    try:
+        # Embed the text
+        vectors = list(embedding_model.embed([req.text]))
+        query_vector = vectors[0].tolist()
         
-    matched_text = hits[0].payload.get("text", "")
-    if not matched_text:
-        return {"error": "NULL PAYLOAD TEXT"}
+        # Search Qdrant
+        response = qdrant.query_points(
+            collection_name=QDRANT_COLLECTION,
+            query=query_vector,
+            limit=1
+        )
         
-    first_word = re.sub(r'[^a-zA-Z0-9]', '', matched_text.split()[0])
-    image_name = f"{first_word.lower()}.png"
-    
-    return {
-        "matched_text": matched_text,
-        "image_name": image_name
-    }
+        hits = response.points
+        
+        if not hits:
+            return {"error": "No close vectors found in Qdrant."}
+            
+        matched_text = hits[0].payload.get("text", "")
+        if not matched_text:
+            return {"error": "Vector matched, but payload had no 'text' field."}
+            
+        # Extract the first word to match the image name
+        first_word = matched_text.split()[0]
+        image_name = f"{first_word}.png"
+        
+        # Construct the Supabase Public URL
+        # Format: https://[URL]/storage/v1/object/public/[BUCKET]/[FILENAME]
+        base_url = SUPABASE_URL.rstrip('/')
+        image_url = f"{base_url}/storage/v1/object/public/{SUPABASE_BUCKET}/{image_name}"
+        
+        return {
+            "matched_text": matched_text,
+            "image_name": image_name,
+            "image_url": image_url
+        }
+    except Exception as e:
+        return {"error": str(e)}
