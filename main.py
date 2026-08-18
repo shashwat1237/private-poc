@@ -10,6 +10,9 @@ from qdrant_client import QdrantClient
 from fastembed import TextEmbedding
 from dotenv import load_dotenv
 
+# Import our new Medical NLP library
+import spacy
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -26,33 +29,49 @@ QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION")
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
+# ==========================================
+# MEDICAL NLP ENGINE (SciSpaCy)
+# ==========================================
+# Load the pre-trained biomedical model (Detects Diseases and Drugs/Chemicals)
+try:
+    med_nlp = spacy.load("en_ner_bc5cdr_md")
+except OSError:
+    raise RuntimeError(
+        "Medical NLP model not found. Please install it using:\n"
+        "pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_ner_bc5cdr_md-0.5.4.tar.gz"
+    )
+
 class SearchRequest(BaseModel):
     text: str
 
-# ==========================================
-# MEDICAL TERM RECOGNITION (Mock)
-# ==========================================
-SAMPLE_MEDICAL_TERMS = [
-    "hypertension", "diabetes", "tachycardia", "myocardial infarction", 
-    "hypoglycemia", "erythema", "blood pressure", "glucose", "arrhythmia",
-    "leukocyte", "hemoglobin", "carcinoma", "edema", "MRI", "CT scan"
-]
-
 def highlight_medical_terms(text: str) -> str:
+    """
+    Uses AI to dynamically find medical entities and wrap them in HTML tags.
+    """
+    doc = med_nlp(text)
+    
+    # We must replace text from the end to the beginning so that changing string 
+    # lengths doesn't mess up the character indices of earlier entities.
+    entities = sorted(doc.ents, key=lambda e: e.start_char, reverse=True)
+    
     highlighted_text = text
-    for term in sorted(SAMPLE_MEDICAL_TERMS, key=len, reverse=True):
-        pattern = re.compile(rf'\b({re.escape(term)})\b', re.IGNORECASE)
-        # Wrapping in a styled span that looks like a terminal data node
-        highlighted_text = pattern.sub(
-            r'<span class="medical-term" data-term="\1">\1</span>', 
-            highlighted_text
-        )
+    
+    for ent in entities:
+        # ent.label_ will be "DISEASE" or "CHEMICAL"
+        term = ent.text
+        start = ent.start_char
+        end = ent.end_char
+        
+        # Wrap the exact detected entity in our terminal node HTML
+        replacement = f'<span class="medical-term" data-term="{term}">{term}</span>'
+        highlighted_text = highlighted_text[:start] + replacement + highlighted_text[end:]
+        
     return highlighted_text
-
 
 # ==========================================
 # FRONTEND (HTML / CSS / JS)
 # ==========================================
+# (The frontend remains the exact same dark-mode terminal layout)
 html_content = """
 <!DOCTYPE html>
 <html lang="en">
@@ -88,7 +107,6 @@ html_content = """
             padding-bottom: 120px;
         }
 
-        /* Custom Scrollbar for Terminal feel */
         ::-webkit-scrollbar { width: 8px; }
         ::-webkit-scrollbar-track { background: var(--bg-base); }
         ::-webkit-scrollbar-thumb { background: var(--accent-blue); border-radius: 4px; }
@@ -124,7 +142,6 @@ html_content = """
             gap: 20px;
         }
 
-        /* Upload Panel Styling */
         .upload-panel { 
             background: var(--bg-panel);
             border: 1px dashed var(--accent-blue);
@@ -159,7 +176,6 @@ html_content = """
         
         input[type="file"] { display: none; }
 
-        /* Terminal Screen (Document Display) */
         .terminal-window {
             background: #020617;
             border: 1px solid var(--border-color);
@@ -207,7 +223,6 @@ html_content = """
             box-shadow: 0 0 10px var(--accent-cyan);
         }
 
-        /* Telemetry Panel (Bottom Bar) */
         .telemetry-panel { 
             position: fixed; 
             bottom: 0; 
@@ -297,11 +312,10 @@ html_content = """
             const file = e.target.files[0];
             if (!file) return;
             
-            // Update UI for loading state
             document.getElementById('file-name-display').textContent = `FILE: ${file.name}`;
-            document.getElementById('doc-status').textContent = 'PROCESSING...';
+            document.getElementById('doc-status').textContent = 'NLP_ENGINE_SCANNING...';
             document.getElementById('doc-status').style.color = '#ff9900';
-            document.getElementById('content-display').textContent = ">> EXTRACTING TEXT & SCANNING FOR MEDICAL ENTITIES...";
+            document.getElementById('content-display').textContent = ">> EXTRACTING TEXT & RUNNING ENTITY RECOGNITION (NER)...\\n>> THIS MAY TAKE A MOMENT DEPENDING ON DOC SIZE...";
             
             const formData = new FormData();
             formData.append('file', file);
@@ -325,12 +339,10 @@ html_content = """
             if (e.target.classList.contains('medical-term')) {
                 const term = e.target.getAttribute('data-term');
                 
-                // Update UI: Target locked
                 const targetBox = document.getElementById('selected-text');
                 targetBox.textContent = `> ${term.toUpperCase()}`;
                 targetBox.className = 'value highlight-cyan';
 
-                // Update UI: Mapping status
                 const matchBox = document.getElementById('result-filename');
                 matchBox.textContent = "QUERYING VECTOR DB...";
                 matchBox.className = 'value';
@@ -386,6 +398,7 @@ async def parse_document(file: UploadFile = File(...)):
         else:
             text = ">> ERROR: UNSUPPORTED FILE FORMAT."
             
+        # Run text through SciSpaCy NLP Engine
         html_text = highlight_medical_terms(text)
         
     except Exception as e:
