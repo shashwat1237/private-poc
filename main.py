@@ -139,8 +139,8 @@ html_content = """
         /* Greatly increased image size. Changed object-fit to 'contain' so nothing gets cut off */
         #result-image { 
             display: none; 
-            max-height: 100px; 
-            max-width: 200px; 
+            max-height: 140px; 
+            max-width: 240px; 
             border-radius: 8px; 
             border: 1px solid #cbd5e0; 
             box-shadow: 0 4px 6px rgba(0,0,0,0.1); 
